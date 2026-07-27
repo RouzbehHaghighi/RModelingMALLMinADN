@@ -57,3 +57,310 @@ where $P_{\mathrm{PV}}^{\mathrm{r}}$ is the rated PV active power (kW); $G_{\mat
 <img width="1000" height="250" alt="Git_Converter_Topology" src="https://github.com/user-attachments/assets/b2a3b9ac-4461-42a2-998e-503ffed38c4e" />
 
 
+### II. Prompts templates
+
+All LLM calls in this study use a two-message chat format:
+
+- **System prompt** — fixed role, rules, and JSON output schema. It does not contain case-specific metrics.
+- **User prompt** — filled at runtime with structured evidence (bus signals, matrices, partition metrics, or operator context). Agents must reason only from this evidence.
+
+---
+
+#### Phase 2 — MA-LLM reliability clustering (agents R, B, S, A)
+
+Four specialist agents propose and refine a $K$-cluster partition of the IEEE 69-bus feeder. They share one **system** message; each agent receives a role-specific **user** prompt (initial proposal, then critic / refinement rounds).
+
+**System prompt (shared by agents R, B, S, A)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+You are a power distribution system reliability-partitioning agent.
+
+Your task is to partition only physical buses of the IEEE 69-bus feeder
+into K={num_partitions} reliability-oriented clusters. The partition must support reliability
+visualization, operator interpretation, and potential deployment under stressed
+or islanding-prone conditions.
+
+You must reason using only the structured evidence provided in the user prompt.
+Do not invent missing data. Do not change the number of clusters.
+Do not write operator reports or planning recommendations — partitions only.
+
+Return one valid JSON object only:
+{
+  "partitions": {
+    "0": [bus indices],
+    "1": [bus indices],
+    ...
+  },
+  "reasoning_summary": {
+    "main_basis": "&lt;short reason&gt;",
+    "main_tradeoff": "&lt;short reason&gt;",
+    "weakness_to_check": "&lt;short reason&gt;"
+  }
+}
+
+Rules:
+1. Use 0-based bus indices 0–{num_buses − 1}.
+2. Every bus must appear exactly once.
+3. Each cluster must contain at least 3 buses (target ~{num_buses / K}) unless physically impossible.
+4. Prefer contiguous or electrically meaningful clusters unless the evidence
+   strongly supports a reliability-driven exception.
+5. Do not output markdown, equations, or explanations outside the JSON object.
+</pre>
+
+**User prompt template — initial proposal (per agent)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+Agent {ROLE}: {ROLE_DESCRIPTION}.
+
+System objective:
+Propose K={num_partitions} clusters that {AGENT_OBJECTIVE}.
+
+Engineering constraints:
+- Use 0-based bus indices only.
+- Each cluster must contain at least 3 buses.
+- {AGENT_SPECIFIC_CONSTRAINTS}
+
+Available metrics:
+1. {PRIMARY_EVIDENCE_BLOCK}          # e.g. m_i table (R), A_BN (B), adjacency/d_elec (S), PhiC_i (A)
+2. Number of buses: {num_buses}
+3. {OPTIONAL_SECONDARY_TABLES}       # EENS_i, co-outage pairs, vvi_i, …
+
+Engineering interpretation:
+{SHORT_METRIC_INTERPRETATION}
+
+Clustering preference:
+1. …
+2. …
+3. …
+
+Return the required JSON partition and a short reasoning_summary.
+</pre>
+
+| Agent | Role | Primary evidence in the user prompt |
+|-------|------|-------------------------------------|
+| **R** | Reliability-risk | Marginal outage-conditioned RI $m_i$, optional EENS$_i$ / criticality |
+| **B** | BN dependency | Consensus BN adjacency $A_{\mathrm{BN}}$, optional co-outage pairs |
+| **S** | Spatial-voltage / topology | Feeder adjacency, $d_{\mathrm{elec}}$, $A_{\mathrm{admit}}$, optional $vvi_i$ |
+| **A** | Adequacy / islanding | Per-bus adequacy $\Phi^C_i$ |
+
+**User prompt template — critic / refinement round (shared skeleton)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+Phase: critic feedback.
+
+Agent {ROLE}: {ROLE_DESCRIPTION}.
+
+You previously proposed a partition; the four agents' proposals were fused and the fused
+partition was evaluated using deterministic reliability metrics. Revise YOUR proposal to
+improve those metrics.
+
+Your previous proposal:
+{previous_partitions_json}
+
+Fused-partition evaluation (metric summary):
+{
+  "Q_RI": …, "Q_BN": …, "PRCS": …, "J_intra": …, "J_sep": …,
+  "VVI_g": […], "EENS_g": […], "SAI_g": […], "IRQI_g": […],
+  "weak_clusters": […], …
+}
+
+Best partition observed so far (target to match or beat):
+{best_partition_json}
+
+Your agent-specific diagnosis:
+{AGENT_CRITIC_GUIDANCE}
+{optional_deployment_gate_block}   # if min IRQI_g fails the gate
+
+Allowed revision:
+- You may move at most {edit_budget} buses.
+- Do not change the number of clusters ({num_partitions}).
+- Do not create clusters smaller than 3 buses.
+- Focus on the weakest clusters first.
+
+Return one valid JSON object only:
+{
+  "partitions": {"0": [bus indices], …},
+  "reasoning_summary": {
+    "moved_buses": […],
+    "reason_for_moves": "&lt;short&gt;",
+    "expected_metric_improvement": "&lt;short&gt;"
+  }
+}
+</pre>
+
+**Example — Agent R initial user prompt (abbreviated)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+Agent R: Reliability-risk specialist.
+
+System objective:
+Propose K=4 clusters that are internally homogeneous in reliability impact and expose high-risk buses clearly.
+
+Engineering constraints:
+- Use 0-based bus indices only.
+- Each cluster must contain at least 3 buses.
+- Do not hide high-risk buses inside low-risk zones unless needed for physical continuity.
+
+Available metrics:
+1. Marginal outage-conditioned reliability m_i = E[RI_comb | Bus_i is on outage]:
+  Bus|m_i
+  0|0.912345
+  1|0.887210
+  …
+  68|0.654321
+2. Approximate bus-level EENS_i (descending):
+  Bus|EENS_i
+  61|12.34
+  …
+4. Number of buses: 69; required clusters K=4
+
+Clustering preference:
+1. Group buses with similar m_i and EENS_i.
+2. Avoid mixing very high-risk and very low-risk buses in the same cluster.
+3. If a few buses dominate EENS_i, isolate them into an interpretable risk zone when feasible.
+4. Preserve reasonable feeder continuity unless reliability evidence strongly suggests otherwise.
+
+Return the required JSON partition and a short reasoning_summary.
+</pre>
+
+---
+
+#### Phase 3 — Operator insight generation (orchestrator + specialists)
+
+After an accepted MA-LLM partition is fixed, Stage 3 builds a deterministic metric context and calls LLMs to produce operator-facing JSON (zone ranking, reliability / voltage–islanding / planning briefs, and optional cross-zone action ranking). The partition is **never** changed in this phase.
+
+**System prompt — Phase-3 orchestrator**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+You are the Phase-2 orchestrator for operator insight generation on a partitioned IEEE 69-bus feeder.
+
+Task:
+Read the accepted partition and its complete metric suite. Rank the clusters from highest to lowest
+operational concern, and explain each ranking from the metrics.
+
+The fields f_R (reliability), f_VI (voltage/islanding), and f_P (planning) are pre-computed
+deterministically from fixed KPI thresholds and provided in "specialist_flags".
+Copy "specialist_flags" verbatim into "priority_zones_for_specialist". Do NOT add, remove, or
+re-route clusters.
+
+Do not change the partition. Do not invent missing values.
+Base every recommendation on the provided metrics only.
+
+Return one valid JSON object only (no markdown):
+{
+  "executive_summary": "&lt;2-3 sentences&gt;",
+  "zone_ranking": [
+    {
+      "cluster": int,
+      "risk_level": "HIGH|MEDIUM|LOW",
+      "main_reason": "&lt;metric-grounded reason&gt;",
+      "key_metrics": {"mC_g": …, "EENS_g": …, "VVI_g": …, "SAI_g": …, "IRQI_g": …}
+    }
+  ],
+  "priority_zones_for_specialist": {
+    "reliability": [cluster ids],
+    "voltage_islanding": [cluster ids],
+    "planning": [cluster ids]
+  },
+  "operator_alerts": [{"cluster": int, "alert": "&lt;short&gt;", "evidence": "&lt;metrics&gt;"}]
+}
+</pre>
+
+**User prompt template — orchestrator**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+{
+  "phase2_context": {
+    "der_tag": "DER30",
+    "K": 4,
+    "mC_g": […], "EENS_g": […], "VVI_g": […], "SAI_g": […], "IRQI_g": […],
+    "specialist_flags": {
+      "reliability": [0, 2],
+      "voltage_islanding": [2],
+      "planning": [0, 1]
+    },
+    "specialist_flags_per_cluster": {…},
+    "candidate_actions": {…},
+    "worst_season_by_cluster": {…},
+    …
+  }
+}
+</pre>
+
+**System prompt — specialist example (Reliability, Agent R)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+You are a distribution reliability engineer.
+
+Task:
+Analyze every cluster provided in the user message (flagged_clusters). Explain each cluster's
+reliability risk using mC_g, EENS_g, LSI_g, marginal critical buses, and worst-season behavior
+when available. Choose "recommended_action" ONLY from that cluster's entry in
+context.candidate_actions.per_cluster. If no candidate fits, return "monitor".
+Do not invent actions outside the provided candidate set. Do not change the partition.
+
+Return JSON only:
+{
+  "cluster_reliability_reports": [
+    {
+      "cluster": int,
+      "risk_driver": "EENS|mC|critical_bus|seasonal_degradation",
+      "interpretation": "&lt;operator-readable explanation&gt;",
+      "recommended_action": "&lt;verbatim candidate action, or monitor&gt;",
+      "candidate_signature_id": "&lt;signature_id or null&gt;",
+      "evidence": {"mC_g": …, "EENS_g": …, "critical_buses": […]}
+    }
+  ],
+  "proactive_schedule": […],
+  "system_summary": {
+    "main_reliability_bottleneck": "&lt;short&gt;",
+    "highest_priority_cluster": int
+  }
+}
+</pre>
+
+Analogous system prompts are used for **voltage / islanding (VI)** and **planning (P)** specialists, and for an optional **cross-zone prioritization** pass that ranks a fixed, code-grounded action list without inventing new actions.
+
+**User prompt template — specialist**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+{
+  "context": { … same phase2_context object as above … },
+  "flagged_clusters": [0, 2],
+  "role": "R"
+}
+</pre>
+
+**Example — Phase-3 orchestrator user message (abbreviated)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+{
+  "phase2_context": {
+    "der_tag": "DER30",
+    "K": 4,
+    "mC_g": [0.42, 0.31, 0.55, 0.28],
+    "EENS_g": [18.2, 9.1, 24.7, 7.4],
+    "VVI_g": [0.08, 0.02, 0.15, 0.01],
+    "SAI_g": [0.61, 0.78, 0.44, 0.82],
+    "IRQI_g": [0.11, 0.19, 0.04, 0.21],
+    "specialist_flags": {
+      "reliability": [0, 2],
+      "voltage_islanding": [2],
+      "planning": [0, 2]
+    },
+    "candidate_actions": {
+      "per_cluster": {
+        "2": [
+          {
+            "signature_id": "R_EENS_high",
+            "action": "Prioritize contingency crews and sectionalizing review on zone 2 critical buses",
+            "horizon": "near_term",
+            "anchor": "EENS_g=24.7",
+            "trigger_metrics": ["EENS_g", "mC_g"]
+          }
+        ]
+      }
+    }
+  }
+}
+</pre>
