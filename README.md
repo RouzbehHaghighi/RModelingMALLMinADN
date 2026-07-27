@@ -75,10 +75,7 @@ Four specialist agents propose and refine a $K$-cluster partition of the IEEE 69
 <pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
 You are a power distribution system reliability-partitioning agent.
 
-Your task is to partition only physical buses of the IEEE 69-bus feeder
-into K={num_partitions} reliability-oriented clusters. The partition must support reliability
-visualization, operator interpretation, and potential deployment under stressed
-or islanding-prone conditions.
+Your task is to partition only physical buses of the IEEE 69-bus feeder into K={num_partitions} reliability-oriented clusters. The partition must support reliability visualization, operator interpretation, and potential deployment under stressed or islanding-prone conditions.
 
 You must reason using only the structured evidence provided in the user prompt.
 Do not invent missing data. Do not change the number of clusters.
@@ -101,10 +98,9 @@ Return one valid JSON object only:
 Rules:
 1. Use 0-based bus indices 0–{num_buses − 1}.
 2. Every bus must appear exactly once.
-3. Each cluster must contain at least 3 buses (target ~{num_buses / K}) unless physically impossible.
-4. Prefer contiguous or electrically meaningful clusters unless the evidence
+3. Prefer contiguous or electrically meaningful clusters unless the evidence
    strongly supports a reliability-driven exception.
-5. Do not output markdown, equations, or explanations outside the JSON object.
+4. Do not output markdown, equations, or explanations outside the JSON object.
 </pre>
 
 **User prompt template — initial proposal (per agent)**
@@ -117,7 +113,6 @@ Propose K={num_partitions} clusters that {AGENT_OBJECTIVE}.
 
 Engineering constraints:
 - Use 0-based bus indices only.
-- Each cluster must contain at least 3 buses.
 - {AGENT_SPECIFIC_CONSTRAINTS}
 
 Available metrics:
@@ -174,7 +169,6 @@ Your agent-specific diagnosis:
 Allowed revision:
 - You may move at most {edit_budget} buses.
 - Do not change the number of clusters ({num_partitions}).
-- Do not create clusters smaller than 3 buses.
 - Focus on the weakest clusters first.
 
 Return one valid JSON object only:
@@ -198,7 +192,6 @@ Propose K=4 clusters that are internally homogeneous in reliability impact and e
 
 Engineering constraints:
 - Use 0-based bus indices only.
-- Each cluster must contain at least 3 buses.
 - Do not hide high-risk buses inside low-risk zones unless needed for physical continuity.
 
 Available metrics:
@@ -364,3 +357,121 @@ Analogous system prompts are used for **voltage / islanding (VI)** and **plannin
   }
 }
 </pre>
+
+---
+
+#### Phase 3 — Operator action ontology and functions
+
+Stage 3 uses a **closed, versioned action ontology** (`OPERATOR_ACTION_ONTOLOGY`, currently **v1.1.0** in `S10_Operator_Insights.py`). LLM specialists **never invent actions**; they **select** from per-cluster `candidate_actions` emitted by deterministic Set-2 KPI signatures in Python, then write the metric-anchored rationale. Each ontology row carries:
+
+| Field | Meaning |
+|-------|---------|
+| `signature_id` | Stable key (e.g. `converter_hardening`) |
+| `horizon` | `planning` (long-term / capital) or `proactive` (stress-window / operational) |
+| `owner` | Specialist that may cite it: `R`, `VI`, or `P` |
+| `lever` | `capex` or `operational` |
+| `cost` | `low` / `med` / `high` (used in cross-zone prioritization) |
+| `action` | Fixed operator-facing wording |
+| `trigger_metrics` | KPI names that justify the fire |
+| `anchor` | Manuscript equation / definition tags for grounding audit |
+| `signature` | Human-readable fire condition |
+
+**Ontology catalog (v1.1.0)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+(A) Planning / capital
+  converter_hardening          owner=P   | Gamma_g top-ranked zone hosting converters; C_c / double-jeopardy
+  volt_var_support             owner=VI  | stress-conditioned CVSI_c &gt; 1+δ (or VVI breach with hosted converters)
+  feeder_reinforcement         owner=R   | EENS_g high-percentile AND mC_g low-percentile in the same zone
+  storage_der_adequacy         owner=P   | marginal IRQI gate fail with SAI_g the limiting factor (islanding value, not EENS cut)
+  exposure_hardening_budget    owner=P   | most-negative DSI_g (peak converter-exposure concentration)
+
+(B) Proactive / operational
+  der_active_power_curtailment     owner=VI  | zone hosts stress-conditioned CVSI converter
+  conservative_voltage_scheduling  owner=VI  | same CVSI / VVI voltage-channel trigger
+  demand_response_load_transfer    owner=R   | EENS_g top zone (non-capital shortfall mitigation)
+  prearm_islanding                 owner=VI  | worst-season IRQI(g,s) still passes the gate
+  no_islanding_reliance            owner=VI  | annual IRQI passes but worst-season IRQI fails
+  crew_prestaging                  owner=R   | EENS_g ranking (highest expected unserved energy)
+  converter_inspection             owner=R   | system-level top-C_c converters (not zone-bound)
+</pre>
+
+**Deterministic specialist flags** (computed before any LLM call; orchestrator cannot override routing):
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+f_R(g)  :  mC_g ≤ pct(mC, INSIGHT_R_MC_PCT)  OR  EENS_g ≥ pct(EENS, INSIGHT_R_EENS_PCT)
+f_VI(g) :  VVI_g ≥ INSIGHT_VI_TRIGGER_VVI    OR  (SAI applicable ∧ IRQI_g &lt; IRQI_GATE_THRESHOLD)
+f_P(g)  :  |DSI_g| ≥ pct(|DSI|, INSIGHT_P_DSI_PCT)   (inactive when DSI unavailable)
+
+Urgency (for action ranking, not LLM risk_level):
+  IMMEDIATE  if channel_count ≥ 2 AND IRQI below gate
+  HIGH       if channel_count ≥ 2
+  MEDIUM     if channel_count = 1
+  LOW        otherwise
+</pre>
+
+**Core Stage-3 functions** (`S10_Operator_Insights.py`)
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+build_phase2_context(row, kpis, *, seasonal_records, dj_converters)
+  → Serialize accepted-partition cluster KPIs (mC_g, EENS_g, VVI_g, SAI_g, IRQI_g,
+    DSI_g, RTR_g, Gamma_g, …) into the Phase-3 evidence bundle; attach
+    worst_season_by_cluster, double_jeopardy_converters, and candidate_actions.
+
+compute_specialist_flags(ctx, *, gating_enabled)
+  → Deterministic f_R / f_VI / f_P per cluster + trigger margins.
+    ROUTING: which clusters each specialist sees.
+    RANKING: channel_count / irqi_below_gate / rank_margin for synthesise_actions.
+
+compute_candidate_actions(ctx, seasonal_rows, dj_converters)
+  → Evaluate OPERATOR_ACTION_ONTOLOGY signatures in Python.
+    Returns {"per_cluster": {g: [records]}, "system": [...],
+             "ontology_version", "ontology_hash"}.
+    LLM may only SELECT from this closed list.
+
+run_phase2_orchestrator(ctx)
+  → LLM zone ranking; specialist_flags overwritten with deterministic flags.
+
+run_phase2_specialist(role, ctx, cluster_ids, system_prompt)
+  → Insight-R / VI / P: select candidate actions + write rationale (JSON).
+
+run_phase2_prioritization(ctx, actions)
+  → Optional hybrid pass: rank grounded actions across zones; may reorder/explain
+    only — cannot invent, reword, or drop actions; urgency tiers re-imposed in code.
+
+synthesise_actions(dashboard)
+  → Flatten candidate_actions into the ranked operator action list
+    (urgency from flags, tie-break by trigger margin; LLM supplies rationale only).
+
+audit_numeric_grounding(insights_json, evidence_bundle)
+  → Faithfulness check: classify numeric literals in orchestrator / specialists /
+    prioritization / actions as GROUNDED vs UNGROUNDED against evidence numerics.
+</pre>
+
+**Stage-3 pipeline (functional order)**
+
+<pre style="background:#f0f0f0;padding:14px;border-radius:6px;overflow:auto;white-space:pre-wrap">
+accepted MA-LLM partition + Set-2 KPIs
+        │
+        ▼
+build_phase2_context  ──►  compute_candidate_actions (ontology fires)
+        │
+        ▼
+compute_specialist_flags  ──►  f_R / f_VI / f_P (routing + ranking)
+        │
+        ▼
+run_phase2_orchestrator  ──►  zone ranking (flags enforced)
+        │
+        ▼
+run_phase2_specialist (R / VI / P)  ──►  select ontology actions + rationale
+        │
+        ▼
+synthesise_actions  ──►  ranked action backbone
+        │
+        ▼
+run_phase2_prioritization (optional)  ──►  cross-zone order + portfolio note
+        │
+        ▼
+audit_numeric_grounding  ──►  faithfulness / grounding rates
+</pre>
+
